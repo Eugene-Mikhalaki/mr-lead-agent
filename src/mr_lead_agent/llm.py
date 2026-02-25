@@ -36,35 +36,50 @@ async def fetch_model_info(
     model: str,
     provider_name: str = "LLM",
 ) -> None:
-    """Query /v1/models/{model} and log context window + release date.
+    """Query /v1/models to log context window + release date.
 
     Non-blocking: errors are caught and logged at DEBUG level only.
     """
-    url = f"{base_url.rstrip('/')}/models/{model}"
-    headers = {"Authorization": f"Bearer {api_key}"}
+    ctx = None
+    created_ts = None
+    
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
-            resp = await client.get(url, headers=headers)
-        if resp.status_code != 200:
-            logger.debug("%s model info unavailable: HTTP %d", provider_name, resp.status_code)
-            return
-        # Fallbacks for known models if API doesn't provide them
-        if not ctx:
-            if "deepseek-chat" in model or "deepseek-reasoner" in model:
-                ctx = 65536
-            elif "llama-3.3" in model:
-                ctx = 131072
+        if provider_name == "DeepSeek":
+            # DeepSeek's API doesn't return context info, so we fetch it from OpenRouter
+            url = "https://openrouter.ai/api/v1/models"
+            openrouter_id = f"deepseek/{model}"
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+                resp = await client.get(url)
+            if resp.status_code == 200:
+                for m in resp.json().get("data", []):
+                    if m.get("id") == openrouter_id:
+                        ctx = m.get("context_length")
+                        created_ts = m.get("created")
+                        break
+        else:
+            url = f"{base_url.rstrip('/')}/models/{model}"
+            headers = {"Authorization": f"Bearer {api_key}"}
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+                resp = await client.get(url, headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                ctx = (
+                    data.get("context_length")
+                    or data.get("max_context_length")
+                    or data.get("context_window")
+                )
+                created_ts = data.get("created")
 
-        if not created_ts and "deepseek-chat" in model:
-            created_str = "2024-12-26"
-        elif not created_ts and "deepseek-reasoner" in model:
-            created_str = "2025-01-20"
-
+        created_str = (
+            datetime.fromtimestamp(created_ts, tz=UTC).strftime("%Y-%m-%d")
+            if created_ts
+            else "n/a"
+        )
         ctx_str = f"{ctx:,}" if ctx else "unknown"
         logger.info(
             "[%s] Model: %s  |  Context window: %s tokens  |  Released: %s",
             provider_name,
-            data.get("id", model),
+            model,
             ctx_str,
             created_str,
         )
