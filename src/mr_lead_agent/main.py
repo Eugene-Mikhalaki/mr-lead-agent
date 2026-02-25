@@ -117,10 +117,10 @@ def cli(
     log_level: str,
 ) -> None:
     """Lead Review Agent — automated GitLab MR code review via Gemini."""
-    _setup_logging(log_level)
-
     if debug:
         log_level = "DEBUG"
+
+    _setup_logging(log_level)
 
     config = Config(
         repo_url=repo_url,
