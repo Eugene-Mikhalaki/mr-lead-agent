@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Poetry
+.python-version
+
+# Type checking / linting caches
+.mypy_cache/
+.ruff_cache/
+.dmypy.json
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Secrets & config
+.env
+*.pem
+*.key
+id_rsa
+id_ed25519
+
+# Project-specific
+repos/
+runs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
