@@ -1,10 +1,11 @@
-"""Async Gemini LLM client: call the API, parse JSON response."""
+"""LLM client: Gemini, DeepSeek, OpenRouter, Groq — all providers in one place."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -27,6 +28,49 @@ _GENERATION_CONFIG = types.GenerateContentConfig(
     temperature=0.2,
     max_output_tokens=8192,
 )
+
+
+async def fetch_model_info(
+    api_key: str,
+    base_url: str,
+    model: str,
+    provider_name: str = "LLM",
+) -> None:
+    """Query /v1/models/{model} and log context window + release date.
+
+    Non-blocking: errors are caught and logged at DEBUG level only.
+    """
+    url = f"{base_url.rstrip('/')}/models/{model}"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+            resp = await client.get(url, headers=headers)
+        if resp.status_code != 200:
+            logger.debug("%s model info unavailable: HTTP %d", provider_name, resp.status_code)
+            return
+        data = resp.json()
+        ctx = (
+            data.get("context_length")
+            or data.get("max_context_length")
+            or data.get("context_window")
+        )
+        created_ts = data.get("created")
+        created_str = (
+            datetime.fromtimestamp(created_ts, tz=UTC).strftime("%Y-%m-%d")
+            if created_ts
+            else "n/a"
+        )
+        ctx_str = f"{ctx:,}" if ctx else "unknown"
+        logger.info(
+            "[%s] Model: %s  |  Context window: %s tokens  |  Released: %s",
+            provider_name,
+            data.get("id", model),
+            ctx_str,
+            created_str,
+        )
+    except Exception as exc:
+        logger.debug("%s model info fetch failed: %s", provider_name, exc)
+
 
 
 def _parse_review_result(raw: str) -> ReviewResult:
@@ -218,6 +262,14 @@ async def _call_openai_compat(
                     return _degraded_result("LLM API error: No choices returned", stats)
 
                 raw_text = choices[0].get("message", {}).get("content", "")
+                # Capture token usage if provided by the API
+                usage = data.get("usage", {})
+                stats.prompt_tokens = int(usage.get("prompt_tokens", 0))
+                stats.completion_tokens = int(usage.get("completion_tokens", 0))
+                logger.debug(
+                    "%s tokens: prompt=%d completion=%d",
+                    provider_name, stats.prompt_tokens, stats.completion_tokens,
+                )
                 logger.debug("%s response length: %d chars", provider_name, len(raw_text))
                 break  # success — exit retry loop
 
@@ -248,6 +300,7 @@ async def call_deepseek(
     model: str = "deepseek-chat",
 ) -> ReviewResult:
     """Send the prompt to DeepSeek (platform.deepseek.com)."""
+    await fetch_model_info(api_key, "https://api.deepseek.com/v1", model, "DeepSeek")
     return await _call_openai_compat(
         prompt=prompt,
         api_key=api_key,

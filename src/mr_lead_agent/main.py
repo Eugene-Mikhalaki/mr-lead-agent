@@ -6,6 +6,7 @@ import asyncio
 import logging
 import sys
 import warnings
+from pathlib import Path
 
 # Suppress ArbitraryTypeWarning emitted by google-genai on import (their internal
 # Pydantic models use `any` as a type — not our code, not actionable).
@@ -26,7 +27,7 @@ import click  # noqa: E402
 
 from mr_lead_agent.config import Config  # noqa: E402
 from mr_lead_agent.gitlab_client import GitLabAPIError, GitLabClient  # noqa: E402
-from mr_lead_agent.llm_gemini import (  # noqa: E402
+from mr_lead_agent.llm import (  # noqa: E402
     call_deepseek,
     call_gemini,
     call_groq,
@@ -85,6 +86,7 @@ def _setup_logging(level: str) -> None:
 @click.option("--allow-dirs", multiple=True, envvar="ALLOW_DIRS", help="Allowed source directories")
 @click.option("--deny-globs", multiple=True, envvar="DENY_GLOBS", help="File glob patterns to exclude")
 @click.option("--dry-run", is_flag=True, default=False, help="Print prompt & stats, skip LLM call")
+@click.option("--debug", is_flag=True, default=False, envvar="DEBUG", help="Save prompt to runs/prompts/ for inspection")
 @click.option("--no-verify-ssl", is_flag=True, default=False, envvar="NO_VERIFY_SSL", help="Disable SSL certificate verification (for self-signed certs)")
 @click.option("--log-level", default="INFO", show_default=True)
 @click.version_option()
@@ -110,11 +112,15 @@ def cli(
     allow_dirs: tuple[str, ...],
     deny_globs: tuple[str, ...],
     dry_run: bool,
+    debug: bool,
     no_verify_ssl: bool,
     log_level: str,
 ) -> None:
     """Lead Review Agent — automated GitLab MR code review via Gemini."""
     _setup_logging(log_level)
+
+    if debug:
+        log_level = "DEBUG"
 
     config = Config(
         repo_url=repo_url,
@@ -138,6 +144,7 @@ def cli(
         allow_dirs=list(allow_dirs),
         deny_globs=list(deny_globs),
         dry_run=dry_run,
+        debug=debug,
         log_level=log_level,
         no_verify_ssl=no_verify_ssl,
     )
@@ -246,6 +253,15 @@ async def run_review(config: Config) -> None:
     if config.dry_run:
         render_dry_run(mr_data, prompt, stats)
         return
+
+    # Save prompt to disk if --debug
+    if config.debug:
+        sha_short = mr_data.sha[:12] if mr_data.sha else "unknown"
+        prompts_dir = Path("./runs/prompts")
+        prompts_dir.mkdir(parents=True, exist_ok=True)
+        prompt_file = prompts_dir / f"mr{mr_data.iid}_{sha_short}.md"
+        prompt_file.write_text(prompt, encoding="utf-8")
+        log.info("[DEBUG] Prompt saved → %s", prompt_file)
 
     # ------------------------------------------------------------------
     # Step 6: Call LLM

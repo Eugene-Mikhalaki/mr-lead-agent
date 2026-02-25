@@ -52,6 +52,11 @@ def render_report(
     stat_table.add_row("Secrets redacted", str(stats.redaction.secrets_replaced))
     stat_table.add_row("URLs redacted", str(stats.redaction.urls_replaced))
     stat_table.add_row("Files excluded", str(stats.redaction.files_excluded))
+    if stats.prompt_tokens:
+        stat_table.add_row("Prompt tokens", f"{stats.prompt_tokens:,}")
+        stat_table.add_row("Completion tokens", f"{stats.completion_tokens:,}")
+        total = stats.prompt_tokens + stats.completion_tokens
+        stat_table.add_row("[dim]Total tokens[/dim]", f"[dim]{total:,}[/dim]")
     if stats.summary_only_mode:
         stat_table.add_row("[yellow]Mode[/yellow]", "[yellow]summary-only (large diff)[/yellow]")
     console.print(Panel(stat_table, title="[dim]Pipeline Stats", border_style="dim"))

@@ -8,7 +8,7 @@ import httpx
 import pytest
 import respx
 
-from mr_lead_agent.llm_gemini import (
+from mr_lead_agent.llm import (
     _call_openai_compat,
     call_deepseek,
     call_groq,

@@ -66,7 +66,15 @@ async def _run_rg(
     repo_path: Path,
     context_lines: int = 4,
 ) -> list[dict[str, object]]:
-    """Run ripgrep and return JSON matches."""
+    """Run ripgrep and return matches with surrounding context lines.
+
+    Each result dict contains:
+        - path: absolute file path string
+        - line_number: line number of the match itself
+        - line_start: first line of the excerpt window
+        - line_end: last line of the excerpt window
+        - excerpt: multi-line string (context before + match + context after)
+    """
     cmd = [
         "rg",
         "--json",
@@ -91,14 +99,51 @@ async def _run_rg(
         logger.warning("ripgrep timed out for pattern %r", pattern)
         return []
 
-    results: list[dict[str, object]] = []
+    # Parse all events into a flat list
+    events: list[dict[str, object]] = []
     for raw_line in stdout.splitlines():
         try:
             obj = json.loads(raw_line)
-            if obj.get("type") == "match":
-                results.append(obj["data"])
-        except (json.JSONDecodeError, KeyError):
+            events.append(obj)
+        except json.JSONDecodeError:
             continue
+
+    # Group events by file block and build excerpts around each match
+    results: list[dict[str, object]] = []
+    current_path: str = ""
+    # Buffer: list of (type, line_number, text) for the current file block
+    block: list[tuple[str, int, str]] = []
+
+    for evt in events:
+        t = str(evt.get("type", ""))
+        data = evt.get("data", {})
+        assert isinstance(data, dict)
+
+        if t == "begin":
+            current_path = str(data.get("path", {}).get("text", ""))  # type: ignore[union-attr]
+            block = []
+        elif t in ("context", "match"):
+            line_num = int(str(data.get("line_number", 0)))
+            line_text: str = str(data.get("lines", {}).get("text", ""))  # type: ignore[union-attr]
+            block.append((t, line_num, line_text))
+        elif t == "end":
+            # Find all match positions in block and build an excerpt for each
+            for idx, (btype, bline, _) in enumerate(block):
+                if btype != "match":
+                    continue
+                # Take context_lines before and after in the block
+                start = max(0, idx - context_lines)
+                end = min(len(block), idx + context_lines + 1)
+                window = block[start:end]
+                excerpt = "".join(text for _, _, text in window)
+                results.append({
+                    "path": current_path,
+                    "line_number": bline,
+                    "line_start": window[0][1],
+                    "line_end": window[-1][1],
+                    "excerpt": excerpt,
+                })
+            block = []
 
     return results
 
@@ -143,7 +188,7 @@ async def search_context(
         matches = await _run_rg(rf"\b{re.escape(token)}\b", repo_path)
 
         for match_data in matches:
-            file_path_abs = str(match_data.get("path", {}).get("text", ""))
+            file_path_abs = str(match_data.get("path", ""))
             # Make path relative to repo root
             try:
                 rel_path = str(Path(file_path_abs).relative_to(repo_path))
@@ -153,19 +198,12 @@ async def search_context(
             if should_exclude_file(rel_path, config.deny_globs, config.allow_dirs):
                 continue
 
-            # Build excerpt from context lines
-            lines: list[dict[str, object]] = match_data.get("lines", {})
-            line_text: str = str(lines.get("text", "")) if isinstance(lines, dict) else ""
-            line_number: int = int(str(match_data.get("line_number", 0)))
-
-            # Try to use surrounding context from rg submatches/context
-            excerpt_lines: list[str] = [line_text.rstrip()]
-            line_start = max(1, line_number - 4)
-            line_end = line_number + 4
-
-            excerpt = "\n".join(excerpt_lines)
+            excerpt: str = str(match_data.get("excerpt", ""))
             if not excerpt.strip():
                 continue
+
+            line_start: int = int(str(match_data.get("line_start", 1)))
+            line_end: int = int(str(match_data.get("line_end", line_start)))
 
             # Enforce per-fragment line limit
             excerpt_trimmed = "\n".join(

@@ -54,7 +54,7 @@ class Blocker(BaseModel):
     file: str
     lines: str
     title: str
-    comment: str
+    comment: str = ""        # optional — LLM may omit it
     suggested_fix: str = ""
     verification: str = ""
 
@@ -86,3 +86,5 @@ class PipelineStats(BaseModel):
     context_lines: int = 0
     redaction: RedactionStats = Field(default_factory=RedactionStats)
     summary_only_mode: bool = False
+    prompt_tokens: int = 0
+    completion_tokens: int = 0

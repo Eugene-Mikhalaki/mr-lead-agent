@@ -82,6 +82,7 @@ class Config(BaseSettings):
 
     # Output
     dry_run: bool = Field(False, description="Print prompt & stats, skip LLM call")
+    debug: bool = Field(False, description="Save prompt to runs/prompts/ for inspection")
     log_level: str = Field("INFO")
     save_runs: bool = Field(True, description="Save result JSON to ./runs/")
 
