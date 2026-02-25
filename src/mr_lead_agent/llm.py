@@ -48,18 +48,18 @@ async def fetch_model_info(
         if resp.status_code != 200:
             logger.debug("%s model info unavailable: HTTP %d", provider_name, resp.status_code)
             return
-        data = resp.json()
-        ctx = (
-            data.get("context_length")
-            or data.get("max_context_length")
-            or data.get("context_window")
-        )
-        created_ts = data.get("created")
-        created_str = (
-            datetime.fromtimestamp(created_ts, tz=UTC).strftime("%Y-%m-%d")
-            if created_ts
-            else "n/a"
-        )
+        # Fallbacks for known models if API doesn't provide them
+        if not ctx:
+            if "deepseek-chat" in model or "deepseek-reasoner" in model:
+                ctx = 65536
+            elif "llama-3.3" in model:
+                ctx = 131072
+
+        if not created_ts and "deepseek-chat" in model:
+            created_str = "2024-12-26"
+        elif not created_ts and "deepseek-reasoner" in model:
+            created_str = "2025-01-20"
+
         ctx_str = f"{ctx:,}" if ctx else "unknown"
         logger.info(
             "[%s] Model: %s  |  Context window: %s tokens  |  Released: %s",
