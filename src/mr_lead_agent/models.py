@@ -68,6 +68,32 @@ class Question(BaseModel):
     why_it_matters: str
 
 
+class MRNote(BaseModel):
+    """A discussion comment from the MR."""
+
+    author: str
+    body: str
+    created_at: str = ""
+    resolved: bool = False
+    file_path: str = ""    # non-empty for inline code comments
+    line: int = 0          # source line for inline code comments
+    code_snippet: str = "" # ±1 line of code around the commented line
+
+
+class MRDiscussion(BaseModel):
+    """A threaded discussion from the MR (one or more notes)."""
+
+    notes: list[MRNote] = Field(default_factory=list)
+
+
+class DiscussionReply(BaseModel):
+    """LLM's response to a developer's comment/question in the MR."""
+
+    original_author: str
+    original_comment: str = ""
+    reply: str
+
+
 class ReviewResult(BaseModel):
     """Structured review result from the LLM."""
 
@@ -75,6 +101,7 @@ class ReviewResult(BaseModel):
     key_risks: list[Risk] = Field(default_factory=list)
     blockers: list[Blocker] = Field(default_factory=list)
     questions_to_author: list[Question] = Field(default_factory=list)
+    discussion_replies: list[DiscussionReply] = Field(default_factory=list)
 
 
 class PipelineStats(BaseModel):

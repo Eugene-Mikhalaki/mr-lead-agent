@@ -33,7 +33,7 @@ from mr_lead_agent.llm import (  # noqa: E402
     call_groq,
     call_openrouter,
 )
-from mr_lead_agent.models import PipelineStats, RedactionStats  # noqa: E402
+from mr_lead_agent.models import MRDiscussion, MRNote, PipelineStats, RedactionStats  # noqa: E402
 from mr_lead_agent.prompt_builder import build_prompt  # noqa: E402
 from mr_lead_agent.redaction import (  # noqa: E402
     redact_internal_urls,
@@ -163,9 +163,10 @@ async def run_review(config: Config) -> None:
     stats = PipelineStats()
 
     # ------------------------------------------------------------------
-    # Step 1: Fetch MR data from GitLab
+    # Step 1: Fetch MR data + discussion comments from GitLab
     # ------------------------------------------------------------------
-    log.info("[Step 1/5] Fetching MR data from GitLab")
+    log.info("[Step 1/6] Fetching MR data from GitLab")
+    discussions: list[MRDiscussion] = []
     try:
         async with GitLabClient(
             config.gitlab_base_url,
@@ -173,6 +174,15 @@ async def run_review(config: Config) -> None:
             ssl_verify=not config.no_verify_ssl,
         ) as gl:
             mr_data = await gl.get_mr_data(config.repo_url, config.mr_iid)
+
+            # Fetch MR discussion threads (pass diff for code snippet extraction)
+            threads_raw = await gl.get_mr_notes(config.repo_url, config.mr_iid, diff=mr_data.diff)
+            discussions = [
+                MRDiscussion(notes=[MRNote(**n) for n in t["notes"]])
+                for t in threads_raw
+            ]
+            log.info("MR discussions: %d threads (reviewer: @%s)",
+                     len(discussions), config.reviewer_username or 'not set')
     except GitLabAPIError as exc:
         _fail(f"GitLab API error: {exc}")
     except Exception as exc:
@@ -245,10 +255,15 @@ async def run_review(config: Config) -> None:
     )
 
     # ------------------------------------------------------------------
-    # Step 5: Build prompt (and stop here if dry-run)
+    # Step 5: Load coding rules + Build prompt
     # ------------------------------------------------------------------
-    log.info("[Step 5/5] Building prompt")
-    prompt = build_prompt(mr_data, safe_fragments, config)
+    log.info("[Step 5/6] Building prompt")
+    rules_content = None
+    rules_path = Path(config.review_rules_file)
+    if rules_path.exists():
+        rules_content = rules_path.read_text(encoding="utf-8")
+        log.info("Loaded coding rules from %s (%d chars)", rules_path, len(rules_content))
+    prompt = build_prompt(mr_data, safe_fragments, config, discussions=discussions, rules_content=rules_content)
 
     if config.dry_run:
         render_dry_run(mr_data, prompt, stats)

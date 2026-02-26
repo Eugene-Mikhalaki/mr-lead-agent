@@ -105,6 +105,16 @@ def render_report(
         console.rule("[dim]Questions to Author", style="dim")
         console.print("  [dim](none)[/dim]")
 
+    # --- 5. Discussion Replies ---
+    if result.discussion_replies:
+        console.rule("[bold cyan]Discussion Replies", style="cyan")
+        for i, dr in enumerate(result.discussion_replies, 1):
+            console.print(f"\n  [bold cyan][{i}][/bold cyan] Re: @{dr.original_author}")
+            if dr.original_comment:
+                short = dr.original_comment[:120]
+                console.print(f"      [dim]> {short}{'...' if len(dr.original_comment) > 120 else ''}[/dim]")
+            console.print(f"      {dr.reply}")
+
     console.rule(style="dim")
 
     # --- Save JSON ---

@@ -86,6 +86,20 @@ class Config(BaseSettings):
     log_level: str = Field("INFO")
     save_runs: bool = Field(True, description="Save result JSON to ./runs/")
 
+    # Review settings
+    reviewer_username: str = Field(
+        "",
+        description="Your GitLab username — comments from this user are excluded from LLM prompt",
+    )
+    review_language: str = Field(
+        "en",
+        description="Language for review output: 'ru' or 'en'",
+    )
+    review_rules_file: str = Field(
+        "./review_rules.md",
+        description="Path to markdown file with coding standards and review checklist",
+    )
+
     @property
     def effective_workdir(self) -> str:
         """Compute workdir from repo_url if not explicitly set."""

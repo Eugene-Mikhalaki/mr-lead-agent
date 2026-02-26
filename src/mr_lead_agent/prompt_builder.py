@@ -6,19 +6,38 @@ import json
 import logging
 
 from mr_lead_agent.config import Config
-from mr_lead_agent.models import ContextFragment, MRData
+from mr_lead_agent.models import ContextFragment, MRData, MRDiscussion
 
 logger = logging.getLogger(__name__)
 
 _ROLE_POLICY = """\
 You are a senior tech-lead performing a code review of a GitLab Merge Request.
-Your role:
-- Be thorough and skeptical, but constructive.
-- Do NOT comment on code style, formatting, or cosmetic issues.
+
+## Instructions
+
+1. Analyse only new/changed code for the task, but study related old code if it is relevant to the changes.
+2. Reference exact line numbers for every issue found.
+3. **Formulate ALL remarks as questions to the developer** — never as assertions or commands.
+   Example: ❓ "Could there be a race condition here if two requests arrive simultaneously?"
+   NOT: "This has a race condition."
+4. Group remarks by file.
+5. Prioritise: critical → important → style.
+
+## Rules
+
+- Do NOT comment on trivial style or formatting issues unless they violate the provided coding rules.
 - Every blocker MUST have a verifiable, specific rationale (not vague concerns).
 - Do NOT invent context or assume things not present in the provided fragments.
 - Prioritise security, correctness, and reliability issues.
 """
+
+_LANGUAGE_INSTRUCTIONS = {
+    "ru": (
+        "IMPORTANT: Write ALL your output (summary, risks, blockers, questions, replies) "
+        "in Russian language. All field values in the JSON must be in Russian."
+    ),
+    "en": "Write all output in English.",
+}
 
 _OUTPUT_SCHEMA = {
     "summary": ["string — 2 to 7 bullet points summarising the change"],
@@ -34,8 +53,8 @@ _OUTPUT_SCHEMA = {
             "severity": "blocker",
             "file": "path/to/file.py",
             "lines": "start-end",
-            "title": "short title",
-            "comment": "detailed comment",
+            "title": "short title as a question (e.g. 'Could this cause a race condition?')",
+            "comment": "detailed comment formulated as a question",
             "suggested_fix": "suggested change (optional)",
             "verification": "how to verify this is fixed",
         }
@@ -46,6 +65,13 @@ _OUTPUT_SCHEMA = {
             "lines": "line range or empty",
             "question": "the question",
             "why_it_matters": "why this is important",
+        }
+    ],
+    "discussion_replies": [
+        {
+            "original_author": "username of the comment author",
+            "original_comment": "first 100 chars of the original comment",
+            "reply": "your answer to their question/comment",
         }
     ],
 }
@@ -61,6 +87,8 @@ def build_prompt(
     mr_data: MRData,
     context_fragments: list[ContextFragment],
     config: Config,
+    discussions: list[MRDiscussion] | None = None,
+    rules_content: str | None = None,
 ) -> str:
     """Assemble the full LLM prompt.
 
@@ -74,7 +102,16 @@ def build_prompt(
     # --- 1. Role / Policy ---
     parts.append("## ROLE & POLICY\n" + _ROLE_POLICY)
 
-    # --- 2. MR Metadata ---
+    # --- 2. Language instruction ---
+    lang_key = config.review_language.lower() if config.review_language else "en"
+    lang_instruction = _LANGUAGE_INSTRUCTIONS.get(lang_key, _LANGUAGE_INSTRUCTIONS["en"])
+    parts.append(f"## LANGUAGE\n{lang_instruction}")
+
+    # --- 3. Coding rules (if provided) ---
+    if rules_content:
+        parts.append(f"## CODING RULES & CHECKLIST\n\n{rules_content}")
+
+    # --- 4. MR Metadata ---
     meta_block = f"""\
 ## MR METADATA
 Title: {mr_data.title}
@@ -91,7 +128,44 @@ Changed files ({len(mr_data.changed_files)}):
 """
     parts.append(meta_block)
 
-    # --- 3. Diff ---
+    # --- 5. MR Discussion Threads ---
+    if discussions:
+        reviewer = config.reviewer_username
+        disc_block = ["## MR DISCUSSION THREADS\n"]
+        disc_block.append(
+            "Below are threaded discussions from the MR. "
+            "Each thread groups related replies together. "
+            "Reply to developer questions/comments in the `discussion_replies` section of your output.\n"
+        )
+        if reviewer:
+            disc_block.append(
+                f"**@{reviewer}** is the reviewer (you are acting on their behalf). "
+                "Do NOT reply to their comments — they are provided as context only. "
+                "Reply ONLY to comments from other participants (developers).\n"
+            )
+        for t_idx, thread in enumerate(discussions, 1):
+            disc_block.append(f"### Thread #{t_idx}")
+            # Show code snippet from the first note that has one
+            first_inline = next(
+                (n for n in thread.notes if n.file_path and n.line), None
+            )
+            if first_inline:
+                loc = f"`{first_inline.file_path}` line {first_inline.line}"
+                disc_block.append(f"📍 Location: {loc}")
+                if first_inline.code_snippet:
+                    disc_block.append(f"```\n{first_inline.code_snippet}\n```")
+
+            for n_idx, note in enumerate(thread.notes):
+                tag = " [REVIEWER]" if reviewer and note.author == reviewer else ""
+                indent = "  ↳ " if n_idx > 0 else ""
+                date_str = note.created_at[:10] if note.created_at else ""
+                disc_block.append(
+                    f"{indent}**@{note.author}**{tag} ({date_str}):\n{indent}> {note.body}\n"
+                )
+            disc_block.append("")  # blank line between threads
+        parts.append("\n".join(disc_block))
+
+    # --- 6. Diff ---
     if summary_only:
         note = _SUMMARY_ONLY_NOTE.format(limit=config.max_diff_lines_full_mode)
         diff_section = f"## DIFF\n{note}\n\n{mr_data.diff}"
@@ -99,7 +173,7 @@ Changed files ({len(mr_data.changed_files)}):
         diff_section = f"## DIFF\n{mr_data.diff}"
     parts.append(diff_section)
 
-    # --- 4. Retrieved context ---
+    # --- 7. Retrieved context ---
     if context_fragments:
         ctx_parts = ["## RETRIEVED CONTEXT\n"]
         for i, frag in enumerate(context_fragments, 1):
@@ -112,7 +186,7 @@ Changed files ({len(mr_data.changed_files)}):
     else:
         parts.append("## RETRIEVED CONTEXT\n(none)")
 
-    # --- 5. Output contract ---
+    # --- 8. Output contract ---
     schema_json = json.dumps(_OUTPUT_SCHEMA, indent=2, ensure_ascii=False)
     output_block = f"""\
 ## OUTPUT CONTRACT
@@ -124,12 +198,17 @@ Constraints:
 - blockers: at most {config.max_blockers} items
 - summary: 2-7 items
 - questions_to_author: 0-10 items
+- discussion_replies: one reply per developer comment (if any comments provided above)
+- All blocker titles and comments must be formulated as questions
 """
     parts.append(output_block)
 
+    total_notes = sum(len(t.notes) for t in discussions) if discussions else 0
     prompt = "\n\n".join(parts)
     logger.info(
-        "Prompt built: %d chars, %d diff lines, %d context fragments, summary_only=%s",
-        len(prompt), diff_lines, len(context_fragments), summary_only,
+        "Prompt built: %d chars, %d diff lines, %d context fragments, "
+        "%d discussion threads (%d notes), summary_only=%s",
+        len(prompt), diff_lines, len(context_fragments),
+        len(discussions) if discussions else 0, total_notes, summary_only,
     )
     return prompt

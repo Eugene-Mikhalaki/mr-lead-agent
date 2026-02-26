@@ -15,6 +15,7 @@ from pydantic import ValidationError
 
 from mr_lead_agent.models import (
     Blocker,
+    DiscussionReply,
     PipelineStats,
     Question,
     ReviewResult,
@@ -89,7 +90,7 @@ async def fetch_model_info(
 
 
 def _parse_review_result(raw: str) -> ReviewResult:
-    """Parse a JSON string from Gemini into a ReviewResult.
+    """Parse a JSON string into a ReviewResult.
 
     Strips markdown code fences if present.
     """
@@ -107,6 +108,7 @@ def _parse_review_result(raw: str) -> ReviewResult:
         key_risks=[Risk(**r) for r in data.get("key_risks", [])],
         blockers=[Blocker(**b) for b in data.get("blockers", [])],
         questions_to_author=[Question(**q) for q in data.get("questions_to_author", [])],
+        discussion_replies=[DiscussionReply(**d) for d in data.get("discussion_replies", [])],
     )
 
 
