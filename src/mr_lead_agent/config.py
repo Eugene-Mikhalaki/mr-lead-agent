@@ -57,11 +57,19 @@ class Config(BaseSettings):
     target_branch: str = Field("main", description="Target branch name")
     workdir: str | None = Field(None, description="Override working directory for repo cache")
     max_blockers: int = Field(10, ge=1, le=50)
-    max_context_fragments: int = Field(12, ge=0, le=100)
     max_fragment_lines: int = Field(160, ge=10, le=500)
-    max_context_chars: int = Field(60_000, ge=1000)
     max_diff_lines_full_mode: int = Field(3000, ge=100)
-    max_fragments_per_file: int = Field(3, ge=1)
+
+    # --- Dynamic token budget ---
+    max_prompt_tokens: int = Field(
+        120_000, description="Total prompt token budget",
+    )
+    max_context_tokens: int = Field(
+        60_000, description="Ceiling for RETRIEVED CONTEXT section tokens",
+    )
+    token_rate: float = Field(
+        0.35, description="Chars-to-tokens coefficient for budget estimation",
+    )
 
     # Retrieval trigger words (configurable)
     trigger_words: list[str] = Field(

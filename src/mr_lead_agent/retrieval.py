@@ -1,4 +1,4 @@
-"""Lexical retrieval: extract tokens from diff and search repo with ripgrep."""
+"""Lexical retrieval: extract tokens from diff and search repo with ripgrep + AST."""
 
 from __future__ import annotations
 
@@ -8,14 +8,19 @@ import logging
 import re
 from pathlib import Path
 
+from mr_lead_agent.ast_extractor import (
+    extract_dockerfile_block,
+    extract_python_definitions,
+    extract_yaml_block,
+)
 from mr_lead_agent.config import Config
 from mr_lead_agent.models import ContextFragment
 from mr_lead_agent.redaction import should_exclude_file
 
 logger = logging.getLogger(__name__)
 
-# Regex for identifiers: \b[A-Za-z_][A-Za-z0-9_]{2,}\b
-_IDENT_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]{2,})\b")
+# Regex for identifiers: \b[A-Za-z_][A-Za-z0-9_]{4,}\b (min 5 chars)
+_IDENT_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]{4,})\b")
 
 # Words to skip (too generic to be useful)
 _STOP_WORDS: frozenset[str] = frozenset(
@@ -24,19 +29,60 @@ _STOP_WORDS: frozenset[str] = frozenset(
         "None", "True", "False", "pass", "raise", "async", "await",
         "elif", "else", "and", "not", "for", "while", "try", "except",
         "finally", "lambda", "yield", "global", "assert",
+        # Generic code words
+        "get", "set", "list", "json", "info", "log", "stat", "var",
+        "idx", "bin", "host", "test", "image", "always", "build",
+        "cache", "cli", "curl", "bash", "update", "next", "version",
+        # Docker-compose/YAML noise
+        "api", "docker", "compose", "condition", "container_name",
+        "depends_on", "services", "healthcheck", "restart",
+        "environment", "ports", "volumes", "networks", "depends",
+        # Tokens that produce too many irrelevant matches
+        "__init__", "localhost", "redis", "interval", "timeout",
+        "retries", "start_period", "python", "sleep", "start_time",
+        "dpage", "login", "install", "systemhooks",
     ]
 )
 
+# File extensions for structured extraction
+_PYTHON_EXTS = {".py"}
+_YAML_EXTS = {".yml", ".yaml"}
+_DOCKER_NAMES = {"Dockerfile", "dockerfile"}
 
-def extract_tokens(diff: str, trigger_words: list[str]) -> list[str]:
+
+def extract_tokens(
+    diff: str, trigger_words: list[str], changed_files: list[str] | None = None,
+) -> list[str]:
     """Extract unique tokens from a unified diff.
 
     Includes:
     - File/directory names from diff headers
     - Identifiers from changed lines (added/removed)
     - Configured trigger words present in the diff
+
+    Excludes tokens that are directory segments of changed_files (too broad).
     """
     tokens: set[str] = set()
+
+    # Collect path segments from changed files to filter overly-broad tokens
+    _changed_path_segments: set[str] = set()
+    for cf in (changed_files or []):
+        for part in Path(cf).parts:
+            seg = part.replace(".py", "").replace(".yml", "").replace(".yaml", "")
+            if len(seg) >= 5:
+                _changed_path_segments.add(seg)
+            # Also add underscore variant of hyphenated segments
+            # e.g. 'squad-upload-aggregate-data' -> 'upload_aggregate_data'
+            if "-" in seg:
+                uscore = seg.replace("-", "_")
+                if len(uscore) >= 5:
+                    _changed_path_segments.add(uscore)
+                # sub-segments after first hyphen part (strip prefix like 'squad-')
+                parts_by_dash = seg.split("-")
+                if len(parts_by_dash) > 1:
+                    suffix = "_".join(parts_by_dash[1:])
+                    if len(suffix) >= 5:
+                        _changed_path_segments.add(suffix)
 
     # File paths from diff headers
     for line in diff.splitlines():
@@ -48,14 +94,18 @@ def extract_tokens(diff: str, trigger_words: list[str]) -> list[str]:
         elif line.startswith(("+", "-")) and not line.startswith(("---", "+++")):
             for match in _IDENT_RE.finditer(line[1:]):
                 word = match.group(1)
-                if word not in _STOP_WORDS and len(word) <= 80:
+                if word not in _STOP_WORDS and not word.isupper():
                     tokens.add(word)
 
-    # Always include trigger words found in the diff
+    # Add trigger words that appear in the diff
     diff_lower = diff.lower()
-    for word in trigger_words:
-        if word.lower() in diff_lower:
-            tokens.add(word)
+    for tw in trigger_words:
+        if tw.lower() in diff_lower:
+            tokens.add(tw)
+
+    # Remove tokens that are directory segments of changed files
+    # (they match every import in that package, producing massive noise)
+    tokens -= _changed_path_segments
 
     logger.debug("Extracted %d tokens from diff", len(tokens))
     return sorted(tokens)
@@ -64,7 +114,7 @@ def extract_tokens(diff: str, trigger_words: list[str]) -> list[str]:
 async def _run_rg(
     pattern: str,
     repo_path: Path,
-    context_lines: int = 4,
+    context_lines: int = 9,
 ) -> list[dict[str, object]]:
     """Run ripgrep and return matches with surrounding context lines.
 
@@ -148,48 +198,159 @@ async def _run_rg(
     return results
 
 
-def _deduplicate(
-    fragments: list[ContextFragment],
-    max_per_file: int,
-) -> list[ContextFragment]:
-    """Remove near-duplicate fragments and enforce per-file limits."""
-    seen_keys: set[tuple[str, int]] = set()
-    per_file: dict[str, int] = {}
-    result: list[ContextFragment] = []
+def _overlap_ratio(a_start: int, a_end: int, b_start: int, b_end: int) -> float:
+    """Return the fraction of the smaller range covered by overlap."""
+    overlap_start = max(a_start, b_start)
+    overlap_end = min(a_end, b_end)
+    if overlap_start >= overlap_end:
+        return 0.0
+    overlap_len = overlap_end - overlap_start
+    smaller_len = min(a_end - a_start, b_end - b_start)
+    return overlap_len / max(smaller_len, 1)
+
+
+def _deduplicate(fragments: list[ContextFragment]) -> list[ContextFragment]:
+    """Remove duplicate, subset, and heavily-overlapping fragments.
+
+    Three-pass approach:
+    1. Skip fragments fully covered by a previously accepted one
+    2. Skip fragments that overlap >50% with a previously accepted one
+    3. Bucket dedup for remaining near-duplicates in the same 20-line window
+    """
+    accepted: list[ContextFragment] = []
 
     for frag in fragments:
-        key = (frag.file_path, frag.line_start // 20)  # bucket by ~20-line window
+        dominated = False
+        for prev in accepted:
+            if prev.file_path != frag.file_path:
+                continue
+            # Full subset
+            if prev.line_start <= frag.line_start and prev.line_end >= frag.line_end:
+                dominated = True
+                break
+            # Heavy overlap: drop the smaller (later-priority) one
+            if _overlap_ratio(
+                prev.line_start, prev.line_end,
+                frag.line_start, frag.line_end,
+            ) >= 0.4:
+                dominated = True
+                break
+        if dominated:
+            continue
+        accepted.append(frag)
+
+    # Bucket dedup for remaining near-duplicates
+    seen_keys: set[tuple[str, int]] = set()
+    result: list[ContextFragment] = []
+    for frag in accepted:
+        key = (frag.file_path, frag.line_start // 20)
         if key in seen_keys:
             continue
-        count = per_file.get(frag.file_path, 0)
-        if count >= max_per_file:
-            continue
         seen_keys.add(key)
-        per_file[frag.file_path] = count + 1
         result.append(frag)
 
     return result
+
+
+def _classify_file(file_path: str) -> str:
+    """Classify file type for extraction strategy."""
+    p = Path(file_path)
+    if p.suffix in _PYTHON_EXTS:
+        return "python"
+    if p.suffix in _YAML_EXTS:
+        return "yaml"
+    if p.name in _DOCKER_NAMES or "dockerfile" in p.name.lower():
+        return "dockerfile"
+    return "other"
 
 
 async def search_context(
     repo_path: Path,
     tokens: list[str],
     config: Config,
+    changed_files: list[str] | None = None,
 ) -> list[ContextFragment]:
-    """Run ripgrep for each token and return deduplicated context fragments."""
+    """Search repository for context fragments with smart extraction.
+
+    Pipeline:
+    1. For each token, try AST-based extraction first (Python definitions)
+    2. Fall back to ripgrep for usages
+    3. Apply structured block extraction for YAML/Docker
+    4. Tag each fragment with type + priority
+    5. Sort by priority, deduplicate
+    6. Return all fragments (budget trimming happens in prompt_builder)
+    """
+    if changed_files is None:
+        changed_files = []
+
+    diff_tokens = set(tokens)
     all_fragments: list[ContextFragment] = []
-    total_chars = 0
+    seen_definitions: set[tuple[str, str]] = set()  # (file, token) already extracted via AST
+
+    # ------------------------------------------------------------------
+    # Pass 1: AST-based extraction for Python files in the repo
+    # ------------------------------------------------------------------
+    # Scan all Python files for definition matches
+    python_files: list[Path] = []
+    for ext in _PYTHON_EXTS:
+        python_files.extend(repo_path.rglob(f"*{ext}"))
+
+    for py_file in python_files:
+        try:
+            rel_path = str(py_file.relative_to(repo_path))
+        except ValueError:
+            continue
+        if should_exclude_file(rel_path, config.deny_globs, config.allow_dirs):
+            continue
+
+        fragments = extract_python_definitions(
+            repo_path, rel_path, diff_tokens, diff_tokens, changed_files,
+        )
+        for frag in fragments:
+            # Enforce per-fragment line limit
+            lines_count = frag.code_excerpt.count("\n") + 1
+            if lines_count > config.max_fragment_lines:
+                frag.code_excerpt = "\n".join(
+                    frag.code_excerpt.splitlines()[: config.max_fragment_lines]
+                ) + "\n    # ... (truncated)"
+
+            all_fragments.append(frag)
+            seen_definitions.add((rel_path, frag.token_match))
+
+    logger.info("AST pass: found %d definitions", len(all_fragments))
+
+    # seen_blocks tracks purely inclusive ranges to avoid subsets
+    seen_blocks: set[tuple[str, int, int]] = set()
+
+    # Register all Pass 1 fragments in seen_blocks
+    for frag in all_fragments:
+        seen_blocks.add((frag.file_path, frag.line_start, frag.line_end))
+
+    def _is_covered(fpath: str, start: int, end: int) -> bool:
+        """Check if [start, end] is fully enclosed in any already seen block."""
+        for sf, ss, se in list(seen_blocks):  # iterate copy
+            if sf == fpath:
+                if ss <= start and se >= end:
+                    return True
+        return False
+
+    def _add_fragment(frag: ContextFragment) -> None:
+        """Add fragment if not purely redundant, and register its bounds."""
+        if not _is_covered(frag.file_path, frag.line_start, frag.line_end):
+            all_fragments.append(frag)
+            seen_blocks.add((frag.file_path, frag.line_start, frag.line_end))
+
+    # ------------------------------------------------------------------
+    # Pass 2: ripgrep for usages (tokens not already found via AST)
+    # ------------------------------------------------------------------
+    # Build set of changed file paths for fast lookup
+    changed_set = set(changed_files)
 
     for token in tokens:
-        if total_chars >= config.max_context_chars:
-            logger.info("Context char limit reached, stopping retrieval")
-            break
-
         matches = await _run_rg(rf"\b{re.escape(token)}\b", repo_path)
 
         for match_data in matches:
             file_path_abs = str(match_data.get("path", ""))
-            # Make path relative to repo root
             try:
                 rel_path = str(Path(file_path_abs).relative_to(repo_path))
             except ValueError:
@@ -198,12 +359,61 @@ async def search_context(
             if should_exclude_file(rel_path, config.deny_globs, config.allow_dirs):
                 continue
 
-            excerpt: str = str(match_data.get("excerpt", ""))
+            # Skip files already in the diff — they are visible in the DIFF section
+            if rel_path in changed_set:
+                continue
+
+            # Skip test/example directories — they don't help understand MR code
+            _rel_lower = rel_path.lower()
+            if "/tests/" in _rel_lower or "/test/" in _rel_lower or "/example" in _rel_lower:
+                continue
+
+            # Skip tiny __init__.py files (just re-exports, not real context)
+            rel_p = Path(rel_path)
+            if rel_p.name == "__init__.py":
+                try:
+                    full = repo_path / rel_path
+                    line_count = full.read_text(errors="replace").count("\n") + 1
+                    if line_count <= 10:
+                        continue
+                except OSError:
+                    pass
+
+            # Skip if we already have an AST definition from this file for this token
+            if (rel_path, token) in seen_definitions:
+                continue
+
+            match_line = int(str(match_data.get("line_number", 1)))
+            file_type = _classify_file(rel_path)
+
+            # Per-fragment budget for block extraction (rough estimate)
+            per_frag_budget = int(config.max_context_tokens / 10 / config.token_rate)
+
+            if file_type == "yaml":
+                frag = extract_yaml_block(
+                    repo_path, rel_path, match_line, per_frag_budget,
+                    token, changed_files,
+                )
+                if frag:
+                    _add_fragment(frag)
+                continue
+
+            if file_type == "dockerfile":
+                frag = extract_dockerfile_block(
+                    repo_path, rel_path, match_line, per_frag_budget,
+                    token, changed_files,
+                )
+                if frag:
+                    _add_fragment(frag)
+                continue
+
+            # Default: use ripgrep excerpt (±9 lines)
+            excerpt = str(match_data.get("excerpt", ""))
             if not excerpt.strip():
                 continue
 
-            line_start: int = int(str(match_data.get("line_start", 1)))
-            line_end: int = int(str(match_data.get("line_end", line_start)))
+            line_start = int(str(match_data.get("line_start", 1)))
+            line_end = int(str(match_data.get("line_end", line_start)))
 
             # Enforce per-fragment line limit
             excerpt_trimmed = "\n".join(
@@ -216,14 +426,22 @@ async def search_context(
                 line_end=line_end,
                 code_excerpt=excerpt_trimmed,
                 token_match=token,
+                fragment_type="usage",
+                priority=50,
             )
-            all_fragments.append(frag)
-            total_chars += len(excerpt_trimmed)
+            _add_fragment(frag)
 
-    deduped = _deduplicate(all_fragments, config.max_fragments_per_file)
-    limited = deduped[: config.max_context_fragments]
+    # ------------------------------------------------------------------
+    # Sort by priority, deduplicate
+    # ------------------------------------------------------------------
+    all_fragments.sort(key=lambda f: (f.priority, f.file_path, f.line_start))
+    deduped = _deduplicate(all_fragments)
+
     logger.info(
-        "Retrieval: %d fragments (from %d raw), %d tokens searched",
-        len(limited), len(all_fragments), len(tokens),
+        "Retrieval: %d fragments (from %d raw), %d tokens searched, "
+        "types: %d definitions, %d usages",
+        len(deduped), len(all_fragments), len(tokens),
+        sum(1 for f in deduped if f.fragment_type != "usage"),
+        sum(1 for f in deduped if f.fragment_type == "usage"),
     )
-    return limited
+    return deduped

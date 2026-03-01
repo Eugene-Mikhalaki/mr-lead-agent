@@ -81,7 +81,7 @@ def _setup_logging(level: str) -> None:
 @click.option("--target-branch", default="main", show_default=True, envvar="TARGET_BRANCH")
 @click.option("--workdir", default=None, envvar="WORKDIR", help="Override repo cache directory")
 @click.option("--max-blockers", default=10, show_default=True, type=int)
-@click.option("--max-context-fragments", default=12, show_default=True, type=int)
+@click.option("--max-context-tokens", default=60000, show_default=True, type=int, envvar="MAX_CONTEXT_TOKENS", help="Max tokens for RETRIEVED CONTEXT")
 @click.option("--max-fragment-lines", default=160, show_default=True, type=int)
 @click.option("--allow-dirs", multiple=True, envvar="ALLOW_DIRS", help="Allowed source directories")
 @click.option("--deny-globs", multiple=True, envvar="DENY_GLOBS", help="File glob patterns to exclude")
@@ -107,7 +107,7 @@ def cli(
     target_branch: str,
     workdir: str | None,
     max_blockers: int,
-    max_context_fragments: int,
+    max_context_tokens: int,
     max_fragment_lines: int,
     allow_dirs: tuple[str, ...],
     deny_globs: tuple[str, ...],
@@ -139,7 +139,7 @@ def cli(
         target_branch=target_branch,
         workdir=workdir,
         max_blockers=max_blockers,
-        max_context_fragments=max_context_fragments,
+        max_context_tokens=max_context_tokens,
         max_fragment_lines=max_fragment_lines,
         allow_dirs=list(allow_dirs),
         deny_globs=list(deny_globs),
@@ -216,9 +216,12 @@ async def run_review(config: Config) -> None:
     # ------------------------------------------------------------------
     log.info("[Step 3/5] Running lexical retrieval")
     try:
-        tokens = extract_tokens(mr_data.diff, config.trigger_words)
+        tokens = extract_tokens(mr_data.diff, config.trigger_words, mr_data.changed_files)
         log.debug("Extracted %d tokens: %s", len(tokens), tokens[:20])
-        raw_fragments = await search_context(repo_path, tokens, config)
+        raw_fragments = await search_context(
+            repo_path, tokens, config,
+            changed_files=mr_data.changed_files,
+        )
         log.debug("Retrieved %d raw fragments", len(raw_fragments))
     except Exception as exc:
         log.warning("Retrieval failed (continuing without context): %s", exc)

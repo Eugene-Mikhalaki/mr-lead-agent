@@ -173,20 +173,7 @@ Changed files ({len(mr_data.changed_files)}):
         diff_section = f"## DIFF\n{mr_data.diff}"
     parts.append(diff_section)
 
-    # --- 7. Retrieved context ---
-    if context_fragments:
-        ctx_parts = ["## RETRIEVED CONTEXT\n"]
-        for i, frag in enumerate(context_fragments, 1):
-            ctx_parts.append(
-                f"### [{i}] FILE: {frag.file_path}  LINES: {frag.line_start}-{frag.line_end}"
-                f"  (matched: {frag.token_match!r})\n"
-                f"```\n{frag.code_excerpt}\n```\n"
-            )
-        parts.append("\n".join(ctx_parts))
-    else:
-        parts.append("## RETRIEVED CONTEXT\n(none)")
-
-    # --- 8. Output contract ---
+    # --- 7. Output contract ---
     schema_json = json.dumps(_OUTPUT_SCHEMA, indent=2, ensure_ascii=False)
     output_block = f"""\
 ## OUTPUT CONTRACT
@@ -203,12 +190,53 @@ Constraints:
 """
     parts.append(output_block)
 
-    total_notes = sum(len(t.notes) for t in discussions) if discussions else 0
+    # --- Base prompt (everything except RETRIEVED CONTEXT) ---
+    base_prompt = "\n\n".join(parts)
+
+    # --- 8. Dynamic budget — fill RETRIEVED CONTEXT ---
+    base_tokens = int(len(base_prompt) * config.token_rate)
+    context_budget_tokens = min(
+        config.max_prompt_tokens - base_tokens,
+        config.max_context_tokens,
+    )
+    context_budget_chars = int(context_budget_tokens / config.token_rate)
+
+    selected: list[ContextFragment] = []
+    used_chars = 0
+
+    if context_fragments:
+        # Fragments are already sorted by priority from retrieval
+        for frag in context_fragments:
+            # Header overhead: "### [N] FILE: ... LINES: ... (type: ...)\n```\n...\n```\n"
+            frag_chars = len(frag.code_excerpt) + 100
+            if used_chars + frag_chars > context_budget_chars:
+                break
+            selected.append(frag)
+            used_chars += frag_chars
+
+    if selected:
+        ctx_parts = ["## RETRIEVED CONTEXT\n"]
+        for i, frag in enumerate(selected, 1):
+            type_label = frag.fragment_type
+            ctx_parts.append(
+                f"### [{i}] FILE: {frag.file_path}  LINES: {frag.line_start}-{frag.line_end}"
+                f"  (type: {type_label}, matched: {frag.token_match!r})\n"
+                f"```\n{frag.code_excerpt}\n```\n"
+            )
+        parts.append("\n".join(ctx_parts))
+    else:
+        parts.append("## RETRIEVED CONTEXT\n(none)")
+
     prompt = "\n\n".join(parts)
+
+    total_notes = sum(len(t.notes) for t in discussions) if discussions else 0
+    used_tokens = int(used_chars * config.token_rate)
     logger.info(
-        "Prompt built: %d chars, %d diff lines, %d context fragments, "
+        "Prompt built: %d chars (~%d tokens), %d diff lines, "
+        "%d context fragments selected (%d/%d budget tokens), "
         "%d discussion threads (%d notes), summary_only=%s",
-        len(prompt), diff_lines, len(context_fragments),
+        len(prompt), int(len(prompt) * config.token_rate),
+        diff_lines, len(selected), used_tokens, context_budget_tokens,
         len(discussions) if discussions else 0, total_notes, summary_only,
     )
     return prompt

@@ -29,6 +29,8 @@ class ContextFragment(BaseModel):
     line_end: int
     code_excerpt: str
     token_match: str = ""
+    fragment_type: str = "usage"  # "definition" | "pydantic_model" | "usage"
+    priority: int = 50           # 0=highest, 100=lowest
 
 
 class RedactionStats(BaseModel):
